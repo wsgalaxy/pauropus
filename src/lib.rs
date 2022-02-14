@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 
-mod chan;
+pub mod chan;
 
 pub enum CtlMsg {
     ForModule(String, Box<dyn Any>),
