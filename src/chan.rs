@@ -224,6 +224,28 @@ where
     rx: mpsc::UnboundedReceiver<(Option<OwnedSemaphorePermit>, T)>,
 }
 
+impl<T> Receiver<T>
+where
+    T: Send + 'static,
+{
+    pub fn sender(&self) -> Option<Sender<T>> {
+        let mut inner = self.chan.inner.lock();
+        if inner.external_tx_count == 0 {
+            None
+        } else {
+            inner.external_tx_count += 1;
+            Some(Sender {
+                chan: self.chan.clone(),
+                tx: inner
+                    .tx_reserve
+                    .as_ref()
+                    .expect("Dangling tx_reserve")
+                    .clone(),
+            })
+        }
+    }
+}
+
 pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>)
 where
     T: Send + 'static,
