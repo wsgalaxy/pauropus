@@ -7,3 +7,4 @@ edition = "2018"
 
 [dependencies]
 tokio = { version = "1.16.1", features = ["full"] }
+parking_lot = "0.12.0"
