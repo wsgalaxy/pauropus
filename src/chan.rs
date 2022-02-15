@@ -1,6 +1,11 @@
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+
+use crate::poll_ready;
 
 struct Chan<T>
 where
@@ -243,6 +248,38 @@ where
                     .clone(),
             })
         }
+    }
+
+    pub fn blocking_recv(&mut self) -> Option<T> {
+        self.rx.blocking_recv().map(|(permit, v)| {
+            drop(permit);
+            v
+        })
+    }
+
+    pub fn close(&mut self) {
+        self.rx.close();
+    }
+
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        Poll::Ready(poll_ready!(self.rx.poll_recv(cx)).map(|(permit, v)| {
+            drop(permit);
+            v
+        }))
+    }
+
+    pub async fn recv(&mut self) -> Option<T> {
+        self.rx.recv().await.map(|(permit, v)| {
+            drop(permit);
+            v
+        })
+    }
+
+    pub fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        self.rx.try_recv().map(|(permit, v)| {
+            drop(permit);
+            v
+        })
     }
 }
 
