@@ -2,7 +2,7 @@ use super::*;
 use pin_project::pin_project;
 use std::future::Future;
 
-pub trait ModFuture<M>: Sized
+pub trait ModFuture<M>: 'static
 where
     M: Module,
 {
@@ -22,7 +22,7 @@ where
 {
     fn then<FutN, F>(self, f: F) -> Then<M, Self, FutN, F>
     where
-        Self: ModFuture<M>,
+        Self: ModFuture<M> + Sized,
         FutN: ModFuture<M>,
         F: FnOnce(Self::Output, &mut M, &mut RunCtx<M>) -> FutN;
 }
@@ -72,7 +72,7 @@ where
     M: Module,
     FutP: ModFuture<M>,
     FutN: ModFuture<M>,
-    F: FnOnce(FutP::Output, &mut M, &mut RunCtx<M>) -> FutN,
+    F: FnOnce(FutP::Output, &mut M, &mut RunCtx<M>) -> FutN + 'static,
 {
     type Output = FutN::Output;
     fn poll(
@@ -111,7 +111,7 @@ where
 impl<M, F> ModFuture<M> for FutureWrap<F>
 where
     M: Module,
-    F: Future,
+    F: Future + 'static,
     F::Output: Send + 'static,
 {
     type Output = F::Output;
