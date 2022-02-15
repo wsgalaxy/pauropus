@@ -6,6 +6,9 @@ use std::{
 };
 
 pub mod chan;
+pub mod fut;
+
+use self::fut::ModFuture;
 
 pub enum CtlMsg {
     ForModule(String, Box<dyn Any>),
@@ -19,9 +22,9 @@ pub trait Module: Send + Sized + 'static {
     type RI: Send + 'static;
     type RO: Send + 'static;
 
-    type HandleMsgWr: AsyncOpCtx<Self, Output = ()>;
-    type HandleMsgRd: AsyncOpCtx<Self, Output = ()>;
-    type HandleMsgCtl: AsyncOpCtx<Self, Output = Option<CtlRsp>>;
+    type HandleMsgWr: ModFuture<Self, Output = ()>;
+    type HandleMsgRd: ModFuture<Self, Output = ()>;
+    type HandleMsgCtl: ModFuture<Self, Output = Option<CtlRsp>>;
 
     fn handle_msg_wr(&mut self, ctx: &mut RunCtx<Self>, msg: Self::WI) -> Self::HandleMsgWr;
     fn handle_msg_rd(&mut self, ctx: &mut RunCtx<Self>, msg: Self::RI) -> Self::HandleMsgRd;
@@ -29,20 +32,6 @@ pub trait Module: Send + Sized + 'static {
     fn get_name(&self) -> &str;
     fn started(&mut self);
     fn stopped(&mut self);
-}
-
-pub trait AsyncOpCtx<M>
-where
-    M: Module,
-{
-    type Output: Send + 'static;
-
-    fn poll(
-        &mut self,
-        task: Context<'_>,
-        module: &mut M,
-        ctx: &mut RunCtx<M>,
-    ) -> Poll<Self::Output>;
 }
 
 pub struct RunCtx<M>
@@ -85,15 +74,15 @@ pub struct ToMsgQueue<Q, Msg> {
     _p: PhantomData<(Q, Msg)>,
 }
 
-impl<M, Q, Msg> AsyncOpCtx<M> for ToMsgQueue<Q, Msg>
+impl<M, Q, Msg> ModFuture<M> for ToMsgQueue<Q, Msg>
 where
     M: Module,
 {
     type Output = ();
 
     fn poll(
-        &mut self,
-        task: Context<'_>,
+        self: Pin<&mut Self>,
+        task: &mut Context<'_>,
         module: &mut M,
         ctx: &mut RunCtx<M>,
     ) -> Poll<Self::Output> {
@@ -120,4 +109,16 @@ where
             _p1: Default::default(),
         }
     }
+}
+
+#[macro_export]
+macro_rules! poll_ready {
+    ($x:expr) => {
+        match $x {
+            Poll::Pending => {
+                return Poll::Pending;
+            }
+            Poll::Ready(v) => v,
+        }
+    };
 }
