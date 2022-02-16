@@ -6,7 +6,6 @@ use std::{
     mem::forget,
     ops::Deref,
     pin::Pin,
-    process::Output,
     task::{Context, Poll},
 };
 
@@ -16,10 +15,10 @@ pub mod fut;
 use self::fut::ModFuture;
 
 pub enum CtlMsg {
-    ForModule(String, Box<dyn Any>),
+    ForModule(String, Box<dyn Any + Send + 'static>),
 }
 
-pub struct CtlRsp(String, Box<dyn Any>);
+pub struct CtlRsp(String, Box<dyn Any + Send + 'static>);
 
 pub trait Module: Send + Sized + 'static {
     type WI: Send + 'static;
@@ -31,9 +30,21 @@ pub trait Module: Send + Sized + 'static {
     type HandleMsgRd: ModFuture<Self, Output = ()>;
     type HandleMsgCtl: ModFuture<Self, Output = Option<CtlRsp>>;
 
-    fn handle_msg_wr(&mut self, ctx: &mut RunCtx<Self>, msg: Self::WI) -> Self::HandleMsgWr;
-    fn handle_msg_rd(&mut self, ctx: &mut RunCtx<Self>, msg: Self::RI) -> Self::HandleMsgRd;
-    fn handle_msg_ctl(&mut self, ctx: &mut RunCtx<Self>, msg: &CtlMsg) -> Self::HandleMsgCtl;
+    fn handle_msg_wr(
+        &mut self,
+        ctx: &mut RunCtx<Self>,
+        msg: Self::WI,
+    ) -> HandleCompletion<Self, ()>;
+    fn handle_msg_rd(
+        &mut self,
+        ctx: &mut RunCtx<Self>,
+        msg: Self::RI,
+    ) -> HandleCompletion<Self, ()>;
+    fn handle_msg_ctl(
+        &mut self,
+        ctx: &mut RunCtx<Self>,
+        msg: &CtlMsg,
+    ) -> HandleCompletion<Self, Option<CtlRsp>>;
     fn get_name(&self) -> &str;
     fn started(&mut self);
     fn stopped(&mut self);
@@ -50,29 +61,56 @@ impl<M> RunCtx<M>
 where
     M: Module,
 {
-    pub fn to_wq_next(&mut self, msg: M::WO) -> ToMsgQueue<(), M::WO> {
-        ToMsgQueue {
-            _p: Default::default(),
-        }
+    pub fn complete<T>(&mut self, v: T) -> HandleCompletion<M, T>
+    where
+        T: Send + 'static,
+    {
+        HandleCompletion::Instant(v)
     }
 
-    pub fn to_wq_self(&mut self, msg: M::WI) -> ToMsgQueue<(), M::WI> {
-        ToMsgQueue {
-            _p: Default::default(),
-        }
+    pub fn complete_later<Fut, T>(&mut self, fut: Fut) -> HandleCompletion<M, T>
+    where
+        Fut: ModFuture<M, Output = T>,
+        T: Send + 'static,
+    {
+        // TODO: Reuse cached ToBeSolved if possible
+        let mut later = ToBeSolved::new();
+        later.as_mut().store(fut);
+        HandleCompletion::Later(later)
     }
 
-    pub fn to_rd_next(&mut self, msg: M::RO) -> ToMsgQueue<(), M::RO> {
-        ToMsgQueue {
-            _p: Default::default(),
-        }
+    pub fn to_wq_next(&mut self, msg: M::WO) {
+        // TODO
     }
 
-    pub fn to_rd_self(&mut self, msg: M::RI) -> ToMsgQueue<(), M::RI> {
-        ToMsgQueue {
-            _p: Default::default(),
-        }
+    pub fn try_to_wq_next(&mut self, msg: M::WO) {
+        // TODO
     }
+
+    pub fn to_wq_self(&mut self, msg: M::WI) {
+        // TODO
+    }
+
+    pub fn to_rd_next(&mut self, msg: M::RO) {
+        // TODO
+    }
+
+    pub fn try_to_rd_next(&mut self, msg: M::RO) {
+        // TODO
+    }
+
+    pub fn to_rd_self(&mut self, msg: M::RI) {
+        // TODO
+    }
+}
+
+pub enum HandleCompletion<M, T>
+where
+    M: Module,
+    T: Send + 'static,
+{
+    Instant(T),
+    Later(Pin<Box<ToBeSolved<M, T>>>),
 }
 
 #[pin_project(PinnedDrop)]
@@ -127,7 +165,16 @@ where
         Poll::Ready(output)
     }
 
-    pub unsafe fn store<Fut>(mut self: Pin<&mut Self>, mut f: Fut)
+    pub fn store<Fut>(self: Pin<&mut Self>, f: Fut)
+    where
+        Fut: ModFuture<M, Output = O>,
+    {
+        unsafe {
+            self._store(f);
+        }
+    }
+
+    unsafe fn _store<Fut>(mut self: Pin<&mut Self>, mut f: Fut)
     where
         Fut: ModFuture<M, Output = O>,
     {
@@ -196,29 +243,6 @@ where
                 );
             }
         }
-    }
-}
-
-pub struct ToMsgQueue<Q, Msg> {
-    _p: PhantomData<(Q, Msg)>,
-}
-
-impl<M, Q, Msg> ModFuture<M> for ToMsgQueue<Q, Msg>
-where
-    M: Module,
-    Msg: 'static,
-    Q: 'static,
-{
-    type Output = ();
-
-    fn poll(
-        self: Pin<&mut Self>,
-        task: &mut Context<'_>,
-        module: &mut M,
-        ctx: &mut RunCtx<M>,
-    ) -> Poll<Self::Output> {
-        // TODO: Send data to queue
-        Poll::Pending
     }
 }
 
