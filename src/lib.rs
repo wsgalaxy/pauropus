@@ -26,25 +26,13 @@ pub trait Module: Send + Sized + 'static {
     type RI: Send + 'static;
     type RO: Send + 'static;
 
-    type HandleMsgWr: ModFuture<Self, Output = ()>;
-    type HandleMsgRd: ModFuture<Self, Output = ()>;
-    type HandleMsgCtl: ModFuture<Self, Output = Option<CtlRsp>>;
-
-    fn handle_msg_wr(
-        &mut self,
-        ctx: &mut RunCtx<Self>,
-        msg: Self::WI,
-    ) -> HandleCompletion<Self, ()>;
-    fn handle_msg_rd(
-        &mut self,
-        ctx: &mut RunCtx<Self>,
-        msg: Self::RI,
-    ) -> HandleCompletion<Self, ()>;
+    fn handle_msg_wr(&mut self, ctx: &mut RunCtx<Self>, msg: Self::WI) -> MsgCompletion<Self, ()>;
+    fn handle_msg_rd(&mut self, ctx: &mut RunCtx<Self>, msg: Self::RI) -> MsgCompletion<Self, ()>;
     fn handle_msg_ctl(
         &mut self,
         ctx: &mut RunCtx<Self>,
         msg: &CtlMsg,
-    ) -> HandleCompletion<Self, Option<CtlRsp>>;
+    ) -> MsgCompletion<Self, Option<CtlRsp>>;
     fn get_name(&self) -> &str;
     fn started(&mut self);
     fn stopped(&mut self);
@@ -61,14 +49,14 @@ impl<M> RunCtx<M>
 where
     M: Module,
 {
-    pub fn complete<T>(&mut self, v: T) -> HandleCompletion<M, T>
+    pub fn complete_msg<T>(&mut self, v: T) -> MsgCompletion<M, T>
     where
         T: Send + 'static,
     {
-        HandleCompletion::Instant(v)
+        MsgCompletion::Instant(v)
     }
 
-    pub fn complete_later<Fut, T>(&mut self, fut: Fut) -> HandleCompletion<M, T>
+    pub fn complete_msg_later<Fut, T>(&mut self, fut: Fut) -> MsgCompletion<M, T>
     where
         Fut: ModFuture<M, Output = T>,
         T: Send + 'static,
@@ -76,7 +64,7 @@ where
         // TODO: Reuse cached ToBeSolved if possible
         let mut later = ToBeSolved::new();
         later.as_mut().store(fut);
-        HandleCompletion::Later(later)
+        MsgCompletion::Later(later)
     }
 
     pub fn to_wq_next(&mut self, msg: M::WO) {
@@ -104,7 +92,7 @@ where
     }
 }
 
-pub enum HandleCompletion<M, T>
+pub enum MsgCompletion<M, T>
 where
     M: Module,
     T: Send + 'static,
@@ -224,6 +212,10 @@ where
             self.layout = Some(Layout::for_value(&f));
             self.fut = Some(Box::new(f));
         }
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        self.fut.is_none()
     }
 }
 
