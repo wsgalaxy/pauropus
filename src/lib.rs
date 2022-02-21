@@ -2,13 +2,14 @@ use pin_project::{pin_project, pinned_drop};
 use std::{
     alloc::{dealloc, Layout},
     any::{Any, TypeId},
+    future::Future,
     marker::PhantomData,
     mem::forget,
     ops::Deref,
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 pub mod chan;
 pub mod fut;
@@ -75,7 +76,7 @@ where
         Fut: ModFuture<M, Output = T>,
         T: Send + 'static,
     {
-        // TODO: Reuse cached ToBeSolved if possible
+        // TODO: Reuse cached ToBeSolved if possible.
         let mut later = ToBeSolved::new();
         later.as_mut().store(fut);
         MsgCompletion::Later(later)
@@ -157,7 +158,7 @@ where
                 .map_unchecked_mut(|v| v.as_mut().unwrap().as_mut())
                 .poll(task, module, ctx)
         });
-        // Future resolved, it is time to drop future and cache the memory for next use
+        // Future resolved, it is time to drop future and cache the memory for next use.
         *(prj.cache) = Some(prj.fut.take().unwrap());
         unsafe {
             let addr = prj.cache.as_ref().unwrap().deref() as *const (dyn ModFuture<M, Output = O>)
@@ -181,44 +182,44 @@ where
         Fut: ModFuture<M, Output = O>,
     {
         if self.fut.is_some() {
-            // Replacing the previous future
+            // Replacing the previous future.
             assert!(self.cache.is_none());
             assert!(self.typeid.is_some());
             assert!(self.layout.is_some());
             if self.typeid.unwrap().ne(&(f.type_id())) {
-                // Type mismatch, We need reallocate memory
+                // Type mismatch, We need reallocate memory.
                 self.typeid = Some(f.type_id());
                 self.layout = Some(Layout::for_value(&f));
                 self.fut = Some(Box::new(f));
             } else {
-                // Type match, Just drop previou future and move f to it
+                // Type match, Just drop previou future and move f to it.
                 let addr =
                     self.fut.as_ref().unwrap().deref() as *const (dyn ModFuture<M, Output = O>);
                 let addr = addr as *const Fut as *mut Fut;
                 std::mem::swap(&mut f, &mut *addr);
-                // Drop the previou future
+                // Drop the previou future.
                 drop(f);
             }
         } else if self.cache.is_some() {
-            // We have cached buffer, no need to allocate new memory any more
+            // We have cached buffer, no need to allocate new memory any more.
             assert!(self.typeid.is_some());
             assert!(self.layout.is_some());
             if self.typeid.unwrap().ne(&(f.type_id())) {
-                // Type mismatch, reallocate anyway
+                // Type mismatch, reallocate anyway.
                 let addr = Box::into_raw(self.cache.take().unwrap());
                 dealloc(addr as *mut u8, self.layout.take().unwrap());
                 self.typeid = Some(f.type_id());
                 self.layout = Some(Layout::for_value(&f));
                 self.fut = Some(Box::new(f));
             } else {
-                // Type match, reuse the previous memory
+                // Type match, reuse the previous memory.
                 self.fut = Some(self.cache.take().unwrap());
                 let dst = self.fut.as_ref().unwrap().deref()
                     as *const (dyn ModFuture<M, Output = O>) as *const u8
                     as *mut u8;
                 let src = &f as *const Fut as *const u8;
                 std::ptr::copy(src, dst, self.layout.as_ref().unwrap().size());
-                // No need to call destructor for f now as it contain a moved value
+                // No need to call destructor for f now as it contain a moved value.
                 forget(f);
             }
         } else {
@@ -290,7 +291,7 @@ where
 
         let (ro_tx_setter, ro_tx_receiver) = oneshot::channel();
         tokio::spawn(async move {
-            // Run ctx here
+            // Run ctx here.
             let ro_tx = match ro_tx_receiver.await {
                 Err(_) => return,
                 Ok(v) => v,
@@ -307,9 +308,13 @@ where
     }
 
     pub fn finish(self) -> Pipeline<WI, RO> {
-        // TODO
+        let (ro_tx, ro_rx) = chan::channel(1024);
+        let _ = self.ro_tx_setter.send(ro_tx);
+
         Pipeline {
-            _p: Default::default(),
+            wi_tx: self.wi_tx,
+            ro_rx,
+            ctl_tx: self.ctl_tx,
         }
     }
 }
@@ -319,7 +324,9 @@ where
     WI: Send + 'static,
     RO: Send + 'static,
 {
-    _p: PhantomData<(WI, RO)>,
+    wi_tx: chan::Sender<WI>,
+    ro_rx: chan::Receiver<RO>,
+    ctl_tx: chan::Sender<CtlEnvelope>,
 }
 
 impl<WI, RO> Pipeline<WI, RO>
@@ -352,6 +359,8 @@ where
             ctl_tx,
         }
     }
+
+    // TODO: Support read, write and ctl.
 }
 
 struct PipelineTail<WI, RO>
@@ -369,8 +378,78 @@ where
     WI: Send + 'static,
     RO: Send + 'static,
 {
-    async fn run(self) {
-        // TODO
+    fn run(self) -> impl Future {
+        PipelineTailRun { tail: self }
+    }
+}
+
+struct PipelineTailRun<WI, RO>
+where
+    WI: Send + 'static,
+    RO: Send + 'static,
+{
+    tail: PipelineTail<WI, RO>,
+}
+
+impl<WI, RO> Future for PipelineTailRun<WI, RO>
+where
+    WI: Send + 'static,
+    RO: Send + 'static,
+{
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut ctl_pending = false;
+        let mut wi_pending = false;
+
+        while !ctl_pending || !wi_pending {
+            for _ in 0..128 {
+                match self.tail.ctl_rx.poll_recv(cx) {
+                    Poll::Pending => {
+                        ctl_pending = true;
+                        break;
+                    }
+                    Poll::Ready(None) => {
+                        // TODO: ctl_rx is dead, close it.
+                        ctl_pending = true;
+                        break;
+                    }
+                    Poll::Ready(Some(v)) => {
+                        // Send all rsp to the receiver.
+                        let (msg, rsp, tx) = v;
+
+                        match msg {
+                            CtlMsg::Stop => {
+                                // Stop polling.
+                                return Poll::Ready(());
+                            }
+                            // Any other msg will be ignored.
+                            _ => {}
+                        }
+
+                        let _ = tx.send(rsp);
+                    }
+                }
+            }
+
+            for _ in 0..128 {
+                match self.tail.wi_rx.poll_recv(cx) {
+                    Poll::Pending => {
+                        wi_pending = true;
+                        break;
+                    }
+                    Poll::Ready(None) => {
+                        // TODO: wi_rx is dead, close it.
+                        wi_pending = true;
+                        break;
+                    }
+                    // Do nothing but drop the msg.
+                    Poll::Ready(_) => {}
+                }
+            }
+        }
+
+        Poll::Pending
     }
 }
 
