@@ -8,6 +8,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+use tokio::sync::oneshot;
 
 pub mod chan;
 pub mod fut;
@@ -15,6 +16,8 @@ pub mod fut;
 use self::fut::ModFuture;
 
 pub enum CtlMsg {
+    Start,
+    Stop,
     ForModule(String, Box<dyn Any + Send + 'static>),
 }
 
@@ -38,17 +41,28 @@ pub trait Module: Send + Sized + 'static {
     fn stopped(&mut self);
 }
 
+type CtlEnvelope = (CtlMsg, Vec<CtlRsp>, oneshot::Sender<Vec<CtlRsp>>);
+
 pub struct RunCtx<M>
 where
     M: Module,
 {
-    _p: PhantomData<M>,
+    wi_rx: chan::Receiver<M::WI>,
+    wo_tx: Option<chan::Sender<M::WO>>,
+    ri_rx: chan::Receiver<M::RI>,
+    ro_tx: Option<chan::Sender<M::RO>>,
+    ctl_rx: chan::Receiver<CtlEnvelope>,
+    ctl_tx: Option<chan::Sender<CtlEnvelope>>,
 }
 
 impl<M> RunCtx<M>
 where
     M: Module,
 {
+    async fn run(self, m: M) {
+        // TODO
+    }
+
     pub fn complete_msg<T>(&mut self, v: T) -> MsgCompletion<M, T>
     where
         T: Send + 'static,
@@ -238,23 +252,125 @@ where
     }
 }
 
-pub struct Handle<M>
+pub struct Handle<WI, RO>
 where
-    M: Module,
+    WI: Send + 'static,
+    RO: Send + 'static,
 {
-    _p1: PhantomData<M>,
+    wi_tx: chan::Sender<WI>,
+    ro_tx_setter: oneshot::Sender<chan::Sender<RO>>,
+    ctl_tx: chan::Sender<CtlEnvelope>,
 }
 
-impl<M> Handle<M>
+impl<WI, RO> Handle<WI, RO>
 where
-    M: Module,
+    WI: Send + 'static,
+    RO: Send + 'static,
 {
-    /// Transfer a module into handle.
-    pub fn from_module(m: M) -> Self {
-        // TODO
-        Self {
-            _p1: Default::default(),
+    pub fn stack<M>(self, m: M, buffer_size: usize) -> Handle<M::WI, M::RO>
+    where
+        M: Module<WO = WI, RI = RO>,
+    {
+        let (wi_tx, wi_rx) = chan::channel(buffer_size);
+        let (ri_tx, ri_rx) = chan::channel(buffer_size);
+        let (ctl_tx, ctl_rx) = chan::channel(buffer_size);
+
+        if let Err(_) = self.ro_tx_setter.send(ri_tx) {
+            panic!("Failed to setup ri_tx");
         }
+
+        let mut ctx = RunCtx::<M> {
+            wi_rx,
+            wo_tx: Some(self.wi_tx),
+            ri_rx,
+            ro_tx: None,
+            ctl_rx,
+            ctl_tx: Some(self.ctl_tx),
+        };
+
+        let (ro_tx_setter, ro_tx_receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            // Run ctx here
+            let ro_tx = match ro_tx_receiver.await {
+                Err(_) => return,
+                Ok(v) => v,
+            };
+            ctx.ro_tx = Some(ro_tx);
+            ctx.run(m).await;
+        });
+
+        Handle {
+            wi_tx,
+            ro_tx_setter,
+            ctl_tx,
+        }
+    }
+
+    pub fn finish(self) -> Pipeline<WI, RO> {
+        // TODO
+        Pipeline {
+            _p: Default::default(),
+        }
+    }
+}
+
+pub struct Pipeline<WI, RO>
+where
+    WI: Send + 'static,
+    RO: Send + 'static,
+{
+    _p: PhantomData<(WI, RO)>,
+}
+
+impl<WI, RO> Pipeline<WI, RO>
+where
+    WI: Send + 'static,
+    RO: Send + 'static,
+{
+    pub fn begin() -> Handle<WI, RO> {
+        let (wi_tx, wi_rx) = chan::channel(1024);
+        let (ctl_tx, ctl_rx) = chan::channel(1024);
+        let (ro_tx_setter, ro_tx_receiver) = oneshot::channel();
+
+        let mut tail = PipelineTail::<WI, RO> {
+            wi_rx,
+            ro_tx: None,
+            ctl_rx,
+        };
+        tokio::spawn(async move {
+            let ro_tx = match ro_tx_receiver.await {
+                Err(_) => return,
+                Ok(v) => v,
+            };
+            tail.ro_tx = Some(ro_tx);
+            tail.run().await;
+        });
+
+        Handle {
+            wi_tx,
+            ro_tx_setter,
+            ctl_tx,
+        }
+    }
+}
+
+struct PipelineTail<WI, RO>
+where
+    WI: Send + 'static,
+    RO: Send + 'static,
+{
+    wi_rx: chan::Receiver<WI>,
+    ro_tx: Option<chan::Sender<RO>>,
+    ctl_rx: chan::Receiver<CtlEnvelope>,
+}
+
+impl<WI, RO> PipelineTail<WI, RO>
+where
+    WI: Send + 'static,
+    RO: Send + 'static,
+{
+    async fn run(self) {
+        // TODO
     }
 }
 
