@@ -116,6 +116,7 @@ where
     Later(Pin<Box<ToBeSolved<M, T>>>),
 }
 
+// TODO: Use tokio_util::sync::ReusableBoxFuture instead.
 #[pin_project(PinnedDrop)]
 pub struct ToBeSolved<M, O>
 where
@@ -360,7 +361,31 @@ where
         }
     }
 
-    // TODO: Support read, write and ctl.
+    pub fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Option<RO>> {
+        self.ro_rx.poll_recv(cx)
+    }
+
+    pub async fn write(&mut self, msg: WI) -> Result<(), mpsc::error::SendError<WI>> {
+        self.wi_tx.send(msg).await
+    }
+
+    pub fn try_write(&mut self, msg: WI) -> Result<(), mpsc::error::TrySendError<WI>> {
+        self.wi_tx.try_send(msg)
+    }
+
+    pub async fn send_ctl(
+        &mut self,
+        ctl_msg: CtlMsg,
+    ) -> Result<Vec<CtlRsp>, mpsc::error::SendError<CtlMsg>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        if let Err(e) = self.ctl_tx.send((ctl_msg, Vec::new(), rsp_tx)).await {
+            return Err(mpsc::error::SendError(e.0 .0));
+        }
+        match rsp_rx.await {
+            Err(_) => Ok(Vec::new()),
+            Ok(v) => Ok(v),
+        }
+    }
 }
 
 struct PipelineTail<WI, RO>
