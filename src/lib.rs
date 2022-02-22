@@ -1,21 +1,24 @@
-use pin_project::{pin_project, pinned_drop};
 use std::{
-    alloc::{dealloc, Layout},
-    any::{Any, TypeId},
+    any::Any,
     future::Future,
     marker::PhantomData,
-    mem::forget,
-    ops::Deref,
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    io::WriteHalf,
+    sync::{
+        mpsc::error::{SendError, TrySendError},
+        oneshot,
+    },
+};
 
 pub mod chan;
 pub mod fut;
 pub mod util;
 
 use self::fut::ModFuture;
+use self::util::ReusableBoxFuture;
 
 pub enum CtlMsg {
     Start,
@@ -25,19 +28,15 @@ pub enum CtlMsg {
 
 pub struct CtlRsp(String, Box<dyn Any + Send + 'static>);
 
-pub trait Module: Send + Sized + 'static {
+pub trait Module: Send + Sized + Unpin + 'static {
     type WI: Send + 'static;
     type WO: Send + 'static;
     type RI: Send + 'static;
     type RO: Send + 'static;
 
-    fn handle_msg_wr(&mut self, ctx: &mut RunCtx<Self>, msg: Self::WI) -> MsgCompletion<Self, ()>;
-    fn handle_msg_rd(&mut self, ctx: &mut RunCtx<Self>, msg: Self::RI) -> MsgCompletion<Self, ()>;
-    fn handle_msg_ctl(
-        &mut self,
-        ctx: &mut RunCtx<Self>,
-        msg: &CtlMsg,
-    ) -> MsgCompletion<Self, Option<CtlRsp>>;
+    fn handle_msg_wr(&mut self, ctx: &mut RunCtx<Self>, msg: Self::WI) -> WrMsgCompletion<Self>;
+    fn handle_msg_rd(&mut self, ctx: &mut RunCtx<Self>, msg: Self::RI) -> RdMsgCompletion<Self>;
+    fn handle_msg_ctl(&mut self, ctx: &mut RunCtx<Self>, msg: &CtlMsg) -> CtlMsgCompletion<Self>;
     fn get_name(&self) -> &str;
     fn started(&mut self);
     fn stopped(&mut self);
@@ -55,6 +54,13 @@ where
     ro_tx: Option<chan::Sender<M::RO>>,
     ctl_rx: chan::Receiver<CtlEnvelope>,
     ctl_tx: Option<chan::Sender<CtlEnvelope>>,
+
+    wr_comp: Option<ReusableBoxFuture<(), M>>,
+    wr_comp_polling: bool,
+    rd_comp: Option<ReusableBoxFuture<(), M>>,
+    rd_comp_polling: bool,
+    ctl_comp: Option<ReusableBoxFuture<Option<CtlRsp>, M>>,
+    ctl_comp_polling: bool,
 }
 
 impl<M> RunCtx<M>
@@ -62,198 +68,252 @@ where
     M: Module,
 {
     async fn run(self, m: M) {
-        // TODO
+        RunCtxFuture {
+            run_ctx: Some(Box::new(self)),
+            module: Some(Box::new(m)),
+        }
+        .await
     }
 
-    pub fn complete_msg<T>(&mut self, v: T) -> MsgCompletion<M, T>
+    pub fn complete_wr(&mut self) -> WrMsgCompletion<M> {
+        assert!(self.wr_comp_polling == false);
+
+        MsgCompletion::Instant((), Default::default())
+    }
+
+    pub fn complete_wr_later<Fut>(&mut self, fut: Fut) -> WrMsgCompletion<M>
     where
-        T: Send + 'static,
+        Fut: ModFuture<M, Output = ()>,
     {
-        MsgCompletion::Instant(v)
+        assert!(self.wr_comp_polling == false);
+
+        self.wr_comp_polling = true;
+        if self.wr_comp.is_some() {
+            let mut _box = self.wr_comp.take().unwrap();
+            _box.set(fut);
+            MsgCompletion::Later(_box)
+        } else {
+            MsgCompletion::Later(ReusableBoxFuture::new(fut))
+        }
     }
 
-    pub fn complete_msg_later<Fut, T>(&mut self, fut: Fut) -> MsgCompletion<M, T>
+    pub fn complete_rd(&mut self) -> RdMsgCompletion<M> {
+        assert!(self.rd_comp_polling == false);
+
+        MsgCompletion::Instant((), Default::default())
+    }
+
+    pub fn complete_rd_later<Fut>(&mut self, fut: Fut) -> RdMsgCompletion<M>
     where
-        Fut: ModFuture<M, Output = T>,
-        T: Send + 'static,
+        Fut: ModFuture<M, Output = ()>,
     {
-        // TODO: Reuse cached ToBeSolved if possible.
-        let mut later = ToBeSolved::new();
-        later.as_mut().store(fut);
-        MsgCompletion::Later(later)
+        assert!(self.rd_comp_polling == false);
+
+        self.rd_comp_polling = true;
+        if self.rd_comp.is_some() {
+            let mut _box = self.rd_comp.take().unwrap();
+            _box.set(fut);
+            MsgCompletion::Later(_box)
+        } else {
+            MsgCompletion::Later(ReusableBoxFuture::new(fut))
+        }
     }
 
-    pub fn to_wq_next(&mut self, msg: M::WO) {
-        // TODO
+    pub fn complete_ctl(&mut self, v: Option<CtlRsp>) -> CtlMsgCompletion<M> {
+        assert!(self.ctl_comp_polling == false);
+
+        MsgCompletion::Instant(v, Default::default())
     }
 
-    pub fn try_to_wq_next(&mut self, msg: M::WO) {
-        // TODO
+    pub fn complete_ctl_later<Fut>(&mut self, fut: Fut) -> CtlMsgCompletion<M>
+    where
+        Fut: ModFuture<M, Output = Option<CtlRsp>>,
+    {
+        assert!(self.ctl_comp_polling == false);
+
+        self.ctl_comp_polling = true;
+        if self.ctl_comp.is_some() {
+            let mut _box = self.ctl_comp.take().unwrap();
+            _box.set(fut);
+            MsgCompletion::Later(_box)
+        } else {
+            MsgCompletion::Later(ReusableBoxFuture::new(fut))
+        }
     }
 
-    pub fn to_wq_self(&mut self, msg: M::WI) {
-        // TODO
+    pub fn to_wq_next(&mut self, msg: M::WO) -> impl Future {
+        let tx = self.wo_tx.clone();
+        async move {
+            match tx {
+                Some(tx) => tx.send(msg).await,
+                None => Ok(()),
+            }
+        }
     }
 
-    pub fn to_rd_next(&mut self, msg: M::RO) {
-        // TODO
+    pub fn try_to_wq_next(&mut self, msg: M::WO) -> Result<(), TrySendError<M::WO>> {
+        match &self.wo_tx {
+            Some(tx) => tx.try_send(msg),
+            None => Ok(()),
+        }
     }
 
-    pub fn try_to_rd_next(&mut self, msg: M::RO) {
-        // TODO
+    pub fn to_wq_self(&mut self, msg: M::WI) -> Result<(), SendError<M::WI>> {
+        let tx = self.wi_rx.sender();
+        match tx {
+            Some(tx) => tx.do_send(msg),
+            None => Ok(()),
+        }
     }
 
-    pub fn to_rd_self(&mut self, msg: M::RI) {
-        // TODO
+    pub fn to_rq_next(&mut self, msg: M::RO) -> impl Future {
+        let tx = self.ro_tx.clone();
+        async move {
+            match tx {
+                Some(tx) => tx.send(msg).await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    pub fn try_to_rq_next(&mut self, msg: M::RO) -> Result<(), TrySendError<M::RO>> {
+        match &self.ro_tx {
+            Some(tx) => tx.try_send(msg),
+            None => Ok(()),
+        }
+    }
+
+    pub fn to_rq_self(&mut self, msg: M::RI) -> Result<(), SendError<M::RI>> {
+        let tx = self.ri_rx.sender();
+        match tx {
+            Some(tx) => tx.do_send(msg),
+            None => Ok(()),
+        }
     }
 }
 
-pub enum MsgCompletion<M, T>
+struct RunCtxFuture<M>
+where
+    M: Module,
+{
+    run_ctx: Option<Box<RunCtx<M>>>,
+    module: Option<Box<M>>,
+}
+
+impl<M> Future for RunCtxFuture<M>
+where
+    M: Module,
+{
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut run_ctx = self.run_ctx.take().unwrap();
+        let mut module = self.module.take().unwrap();
+        loop {
+            loop {
+                if run_ctx.wr_comp_polling {
+                    assert!(run_ctx.wr_comp.is_some());
+                    let mut wr_comp = run_ctx.wr_comp.take().unwrap();
+                    let res = wr_comp.poll(cx, &mut module, &mut run_ctx);
+                    // Store the wr_comp back so that we can reuse it.
+                    run_ctx.wr_comp = Some(wr_comp);
+                    match res {
+                        Poll::Pending => {
+                            // We can not handle new msg from channel.
+                            break;
+                        }
+                        Poll::Ready(_) => {
+                            run_ctx.wr_comp_polling = false;
+                        }
+                    }
+                }
+                // Handle new msg
+                match run_ctx.wi_rx.poll_recv(cx) {
+                    Poll::Pending => {
+                        // No msg from channel.
+                        break;
+                    }
+                    Poll::Ready(None) => {
+                        // The channel is dead.
+                        // TODO: Close it.
+                        break;
+                    }
+                    Poll::Ready(Some(msg)) => {
+                        match module.handle_msg_wr(&mut run_ctx, msg) {
+                            MsgCompletion::Instant(_, _) => {
+                                // Ready to handle next msg.
+                                continue;
+                            }
+                            MsgCompletion::Later(mut _box) => {
+                                match _box.poll(cx, &mut module, &mut run_ctx) {
+                                    Poll::Pending => {
+                                        // This msg need to be polled again.
+                                        run_ctx.wr_comp = Some(_box);
+                                        run_ctx.wr_comp_polling = true;
+                                        break;
+                                    }
+                                    Poll::Ready(_) => {
+                                        // Recycle box for next use.
+                                        run_ctx.wr_comp = Some(_box);
+                                        // Ready to handle next msg.
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // TODO: Handle rd, ctl.
+            // TODO: Loop for limited times.
+        }
+        self.run_ctx = Some(run_ctx);
+        self.module = Some(module);
+        Poll::Pending
+    }
+}
+
+struct ToQueueFuture<T>
+where
+    T: Send + Unpin + 'static,
+{
+    tx: Option<chan::Sender<T>>,
+    v: Option<T>,
+}
+
+impl<T> Future for ToQueueFuture<T>
+where
+    T: Send + Unpin + 'static,
+{
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // TODO
+        Poll::Pending
+    }
+}
+
+pub trait MsgType: Send + 'static {}
+pub struct MsgTypeWr {}
+impl MsgType for MsgTypeWr {}
+pub struct MsgTypeRd {}
+impl MsgType for MsgTypeRd {}
+pub struct MsgTypeCtl {}
+impl MsgType for MsgTypeCtl {}
+
+pub enum MsgCompletion<M, T, MT>
 where
     M: Module,
     T: Send + 'static,
+    MT: MsgType,
 {
-    Instant(T),
-    Later(Pin<Box<ToBeSolved<M, T>>>),
+    Instant(T, PhantomData<MT>),
+    Later(ReusableBoxFuture<T, M>),
 }
 
-// TODO: Use tokio_util::sync::ReusableBoxFuture instead.
-#[pin_project(PinnedDrop)]
-pub struct ToBeSolved<M, O>
-where
-    M: Module,
-    O: Send + 'static,
-{
-    #[pin]
-    fut: Option<Box<dyn ModFuture<M, Output = O>>>,
-    cache: Option<Box<dyn ModFuture<M, Output = O>>>,
-    typeid: Option<TypeId>,
-    layout: Option<Layout>,
-}
-
-impl<M, O> ToBeSolved<M, O>
-where
-    M: Module,
-    O: Send + 'static,
-{
-    pub fn new() -> Pin<Box<Self>> {
-        Box::pin(Self {
-            fut: None,
-            cache: None,
-            typeid: None,
-            layout: None,
-        })
-    }
-
-    pub fn poll(
-        self: Pin<&mut Self>,
-        task: &mut Context<'_>,
-        module: &mut M,
-        ctx: &mut RunCtx<M>,
-    ) -> Poll<O> {
-        assert!(self.fut.is_some(), "Polling an empty Future");
-        assert!(self.cache.is_none());
-        let mut prj = self.project();
-        let output = poll_ready!(unsafe {
-            prj.fut
-                .as_mut()
-                .map_unchecked_mut(|v| v.as_mut().unwrap().as_mut())
-                .poll(task, module, ctx)
-        });
-        // Future resolved, it is time to drop future and cache the memory for next use.
-        *(prj.cache) = Some(prj.fut.take().unwrap());
-        unsafe {
-            let addr = prj.cache.as_ref().unwrap().deref() as *const (dyn ModFuture<M, Output = O>)
-                as *mut (dyn ModFuture<M, Output = O>);
-            std::ptr::drop_in_place(addr);
-        }
-        Poll::Ready(output)
-    }
-
-    pub fn store<Fut>(self: Pin<&mut Self>, f: Fut)
-    where
-        Fut: ModFuture<M, Output = O>,
-    {
-        unsafe {
-            self._store(f);
-        }
-    }
-
-    unsafe fn _store<Fut>(mut self: Pin<&mut Self>, mut f: Fut)
-    where
-        Fut: ModFuture<M, Output = O>,
-    {
-        if self.fut.is_some() {
-            // Replacing the previous future.
-            assert!(self.cache.is_none());
-            assert!(self.typeid.is_some());
-            assert!(self.layout.is_some());
-            if self.typeid.unwrap().ne(&(f.type_id())) {
-                // Type mismatch, We need reallocate memory.
-                self.typeid = Some(f.type_id());
-                self.layout = Some(Layout::for_value(&f));
-                self.fut = Some(Box::new(f));
-            } else {
-                // Type match, Just drop previou future and move f to it.
-                let addr =
-                    self.fut.as_ref().unwrap().deref() as *const (dyn ModFuture<M, Output = O>);
-                let addr = addr as *const Fut as *mut Fut;
-                std::mem::swap(&mut f, &mut *addr);
-                // Drop the previou future.
-                drop(f);
-            }
-        } else if self.cache.is_some() {
-            // We have cached buffer, no need to allocate new memory any more.
-            assert!(self.typeid.is_some());
-            assert!(self.layout.is_some());
-            if self.typeid.unwrap().ne(&(f.type_id())) {
-                // Type mismatch, reallocate anyway.
-                let addr = Box::into_raw(self.cache.take().unwrap());
-                dealloc(addr as *mut u8, self.layout.take().unwrap());
-                self.typeid = Some(f.type_id());
-                self.layout = Some(Layout::for_value(&f));
-                self.fut = Some(Box::new(f));
-            } else {
-                // Type match, reuse the previous memory.
-                self.fut = Some(self.cache.take().unwrap());
-                let dst = self.fut.as_ref().unwrap().deref()
-                    as *const (dyn ModFuture<M, Output = O>) as *const u8
-                    as *mut u8;
-                let src = &f as *const Fut as *const u8;
-                std::ptr::copy(src, dst, self.layout.as_ref().unwrap().size());
-                // No need to call destructor for f now as it contain a moved value.
-                forget(f);
-            }
-        } else {
-            self.typeid = Some(f.type_id());
-            self.layout = Some(Layout::for_value(&f));
-            self.fut = Some(Box::new(f));
-        }
-    }
-
-    pub fn is_resolved(&self) -> bool {
-        self.fut.is_none()
-    }
-}
-
-#[pinned_drop]
-impl<M, O> PinnedDrop for ToBeSolved<M, O>
-where
-    M: Module,
-    O: Send + 'static,
-{
-    fn drop(mut self: Pin<&mut Self>) {
-        if let Some(b) = self.cache.take() {
-            // Value contained in self.cache is invalid, do not call destructor for it.
-            unsafe {
-                dealloc(
-                    Box::into_raw(b) as *const u8 as *mut u8,
-                    self.layout.take().unwrap(),
-                );
-            }
-        }
-    }
-}
+type WrMsgCompletion<M> = MsgCompletion<M, (), MsgTypeWr>;
+type RdMsgCompletion<M> = MsgCompletion<M, (), MsgTypeRd>;
+type CtlMsgCompletion<M> = MsgCompletion<M, Option<CtlRsp>, MsgTypeCtl>;
 
 pub struct Handle<WI, RO>
 where
@@ -289,6 +349,13 @@ where
             ro_tx: None,
             ctl_rx,
             ctl_tx: Some(self.ctl_tx),
+
+            wr_comp_polling: false,
+            wr_comp: None,
+            rd_comp_polling: false,
+            rd_comp: None,
+            ctl_comp_polling: false,
+            ctl_comp: None,
         };
 
         let (ro_tx_setter, ro_tx_receiver) = oneshot::channel();
@@ -370,21 +437,18 @@ where
         self.ro_rx.recv().await
     }
 
-    pub async fn write(&mut self, msg: WI) -> Result<(), mpsc::error::SendError<WI>> {
+    pub async fn write(&mut self, msg: WI) -> Result<(), SendError<WI>> {
         self.wi_tx.send(msg).await
     }
 
-    pub fn try_write(&mut self, msg: WI) -> Result<(), mpsc::error::TrySendError<WI>> {
+    pub fn try_write(&mut self, msg: WI) -> Result<(), TrySendError<WI>> {
         self.wi_tx.try_send(msg)
     }
 
-    pub async fn send_ctl(
-        &mut self,
-        ctl_msg: CtlMsg,
-    ) -> Result<Vec<CtlRsp>, mpsc::error::SendError<CtlMsg>> {
+    pub async fn send_ctl(&mut self, ctl_msg: CtlMsg) -> Result<Vec<CtlRsp>, SendError<CtlMsg>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
         if let Err(e) = self.ctl_tx.send((ctl_msg, Vec::new(), rsp_tx)).await {
-            return Err(mpsc::error::SendError(e.0 .0));
+            return Err(SendError(e.0 .0));
         }
         match rsp_rx.await {
             // If no resp, return a empty vector.
@@ -421,11 +485,11 @@ impl<WI> PipelineWritePart<WI>
 where
     WI: Send + 'static,
 {
-    pub async fn write(&mut self, msg: WI) -> Result<(), mpsc::error::SendError<WI>> {
+    pub async fn write(&mut self, msg: WI) -> Result<(), SendError<WI>> {
         self.wi_tx.send(msg).await
     }
 
-    pub fn try_write(&mut self, msg: WI) -> Result<(), mpsc::error::TrySendError<WI>> {
+    pub fn try_write(&mut self, msg: WI) -> Result<(), TrySendError<WI>> {
         self.wi_tx.try_send(msg)
     }
 }
@@ -455,13 +519,10 @@ pub struct PipelineCtlpPart {
 }
 
 impl PipelineCtlpPart {
-    pub async fn send_ctl(
-        &mut self,
-        ctl_msg: CtlMsg,
-    ) -> Result<Vec<CtlRsp>, mpsc::error::SendError<CtlMsg>> {
+    pub async fn send_ctl(&mut self, ctl_msg: CtlMsg) -> Result<Vec<CtlRsp>, SendError<CtlMsg>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
         if let Err(e) = self.ctl_tx.send((ctl_msg, Vec::new(), rsp_tx)).await {
-            return Err(mpsc::error::SendError(e.0 .0));
+            return Err(SendError(e.0 .0));
         }
         match rsp_rx.await {
             // If no resp, return a empty vector.
