@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub mod chan;
 pub mod fut;
+pub mod util;
 
 use self::fut::ModFuture;
 
