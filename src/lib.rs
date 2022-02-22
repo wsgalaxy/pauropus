@@ -365,6 +365,10 @@ where
         self.ro_rx.poll_recv(cx)
     }
 
+    pub async fn read(&mut self) -> Option<RO> {
+        self.ro_rx.recv().await
+    }
+
     pub async fn write(&mut self, msg: WI) -> Result<(), mpsc::error::SendError<WI>> {
         self.wi_tx.send(msg).await
     }
@@ -382,6 +386,84 @@ where
             return Err(mpsc::error::SendError(e.0 .0));
         }
         match rsp_rx.await {
+            // If no resp, return a empty vector.
+            Err(_) => Ok(Vec::new()),
+            Ok(v) => Ok(v),
+        }
+    }
+
+    pub fn splict(
+        self,
+    ) -> (
+        PipelineWritePart<WI>,
+        PipelineReadPart<RO>,
+        PipelineCtlpPart,
+    ) {
+        (
+            PipelineWritePart { wi_tx: self.wi_tx },
+            PipelineReadPart { ro_rx: self.ro_rx },
+            PipelineCtlpPart {
+                ctl_tx: self.ctl_tx,
+            },
+        )
+    }
+}
+
+pub struct PipelineWritePart<WI>
+where
+    WI: Send + 'static,
+{
+    wi_tx: chan::Sender<WI>,
+}
+
+impl<WI> PipelineWritePart<WI>
+where
+    WI: Send + 'static,
+{
+    pub async fn write(&mut self, msg: WI) -> Result<(), mpsc::error::SendError<WI>> {
+        self.wi_tx.send(msg).await
+    }
+
+    pub fn try_write(&mut self, msg: WI) -> Result<(), mpsc::error::TrySendError<WI>> {
+        self.wi_tx.try_send(msg)
+    }
+}
+
+pub struct PipelineReadPart<RO>
+where
+    RO: Send + 'static,
+{
+    ro_rx: chan::Receiver<RO>,
+}
+
+impl<RO> PipelineReadPart<RO>
+where
+    RO: Send + 'static,
+{
+    pub fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Option<RO>> {
+        self.ro_rx.poll_recv(cx)
+    }
+
+    pub async fn read(&mut self) -> Option<RO> {
+        self.ro_rx.recv().await
+    }
+}
+
+pub struct PipelineCtlpPart {
+    ctl_tx: chan::Sender<CtlEnvelope>,
+}
+
+impl PipelineCtlpPart {
+    pub async fn send_ctl(
+        &mut self,
+        ctl_msg: CtlMsg,
+    ) -> Result<Vec<CtlRsp>, mpsc::error::SendError<CtlMsg>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        if let Err(e) = self.ctl_tx.send((ctl_msg, Vec::new(), rsp_tx)).await {
+            return Err(mpsc::error::SendError(e.0 .0));
+        }
+        match rsp_rx.await {
+            // If no resp, return a empty vector.
             Err(_) => Ok(Vec::new()),
             Ok(v) => Ok(v),
         }
