@@ -5,12 +5,9 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::{
-    io::WriteHalf,
-    sync::{
-        mpsc::error::{SendError, TrySendError},
-        oneshot,
-    },
+use tokio::sync::{
+    mpsc::error::{SendError, TrySendError},
+    oneshot,
 };
 
 pub mod chan;
@@ -61,6 +58,8 @@ where
     rd_comp_polling: bool,
     ctl_comp: Option<ReusableBoxFuture<Option<CtlRsp>, M>>,
     ctl_comp_polling: bool,
+
+    ctl_env: Option<CtlEnvelope>,
 }
 
 impl<M> RunCtx<M>
@@ -192,12 +191,175 @@ where
     }
 }
 
+enum PollResult {
+    Pending,
+    Again,
+}
+
 struct RunCtxFuture<M>
 where
     M: Module,
 {
     run_ctx: Option<Box<RunCtx<M>>>,
     module: Option<Box<M>>,
+}
+
+// Poll wi_rx/ri_rx.
+macro_rules! poll_channel {
+    ($fn_name:ident, $chan:ident, $comp:ident, $comp_polling:ident, $handler:ident, $handle_value:ident, $handle_res:ident) => {
+        fn $fn_name(cx: &mut Context<'_>, run_ctx: &mut RunCtx<M>, module: &mut M) -> PollResult {
+            for _ in 0..128 {
+                if run_ctx.$comp_polling {
+                    assert!(run_ctx.$comp.is_some());
+                    let mut $comp = run_ctx.$comp.take().unwrap();
+                    let res = $comp.poll(cx, module, run_ctx);
+                    // Store the $comp back so that we can reuse it.
+                    run_ctx.$comp = Some($comp);
+                    match res {
+                        Poll::Pending => {
+                            // We can not handle new msg from channel.
+                            return PollResult::Pending;
+                        }
+                        Poll::Ready(_) => {
+                            run_ctx.$comp_polling = false;
+                        }
+                    }
+                }
+                // Handle new msg
+                match run_ctx.$chan.poll_recv(cx) {
+                    Poll::Pending => {
+                        // No msg from channel.
+                        return PollResult::Pending;
+                    }
+                    Poll::Ready(None) => {
+                        // The channel is dead.
+                        // TODO: Close it.
+                        return PollResult::Pending;
+                    }
+                    Poll::Ready(Some(msg)) => {
+                        match $handle_value(run_ctx, module, msg) {
+                            MsgCompletion::Instant(_, _) => {
+                                // Ready to handle next msg.
+                                continue;
+                            }
+                            MsgCompletion::Later(mut _box) => {
+                                match _box.poll(cx, module, run_ctx) {
+                                    Poll::Pending => {
+                                        // This msg need to be polled again.
+                                        run_ctx.$comp = Some(_box);
+                                        run_ctx.$comp_polling = true;
+                                        return PollResult::Pending;
+                                    }
+                                    Poll::Ready(v) => {
+                                        $handle_res(run_ctx, module, v);
+                                        // Recycle box for next use.
+                                        run_ctx.$comp = Some(_box);
+                                        // Ready to handle next msg.
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Need to be pooled again.
+            PollResult::Again
+        }
+    };
+}
+
+fn handle_value_ri<M>(run_ctx: &mut RunCtx<M>, module: &mut M, msg: M::RI) -> RdMsgCompletion<M>
+where
+    M: Module,
+{
+    module.handle_msg_rd(run_ctx, msg)
+}
+
+fn handle_value_wi<M>(run_ctx: &mut RunCtx<M>, module: &mut M, msg: M::WI) -> WrMsgCompletion<M>
+where
+    M: Module,
+{
+    module.handle_msg_wr(run_ctx, msg)
+}
+
+fn handle_value_ctl<M>(
+    run_ctx: &mut RunCtx<M>,
+    module: &mut M,
+    msg: CtlEnvelope,
+) -> CtlMsgCompletion<M>
+where
+    M: Module,
+{
+    let res = module.handle_msg_ctl(run_ctx, &msg.0);
+    run_ctx.ctl_env = Some(msg);
+    res
+}
+
+fn handle_res_wr<M, T>(run_ctx: &mut RunCtx<M>, module: &mut M, _v: T)
+where
+    M: Module,
+    T: Send + 'static,
+{
+}
+
+fn handle_res_ctl<M>(run_ctx: &mut RunCtx<M>, module: &mut M, v: Option<CtlRsp>)
+where
+    M: Module,
+{
+    assert!(run_ctx.ctl_env.is_some());
+    let mut env = run_ctx.ctl_env.take().unwrap();
+    if let Some(rsp) = v {
+        env.1.push(rsp);
+    }
+    // Send CtlEnvelop to next module
+    if let Some(ref mut tx) = run_ctx.ctl_tx {
+        match tx.do_send(env) {
+            Ok(_) => {}
+            Err(SendError(env)) => {
+                // Failed to send to next module, just response.
+                let (_, rsps, rsp_tx) = env;
+                let _ = rsp_tx.send(rsps);
+            }
+        }
+    } else {
+        // Just response.
+        let (_, rsps, rsp_tx) = env;
+        let _ = rsp_tx.send(rsps);
+    }
+}
+
+impl<M> RunCtxFuture<M>
+where
+    M: Module,
+{
+    poll_channel!(
+        poll_wi,
+        wi_rx,
+        wr_comp,
+        wr_comp_polling,
+        handle_msg_wr,
+        handle_value_wi,
+        handle_res_wr
+    );
+    poll_channel!(
+        poll_ri,
+        ri_rx,
+        rd_comp,
+        rd_comp_polling,
+        handle_msg_rd,
+        handle_value_ri,
+        handle_res_wr
+    );
+    poll_channel!(
+        poll_ctl,
+        ctl_rx,
+        ctl_comp,
+        ctl_comp_polling,
+        handle_msg_ctl,
+        handle_value_ctl,
+        handle_res_ctl
+    );
 }
 
 impl<M> Future for RunCtxFuture<M>
@@ -209,86 +371,38 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut run_ctx = self.run_ctx.take().unwrap();
         let mut module = self.module.take().unwrap();
-        loop {
-            loop {
-                if run_ctx.wr_comp_polling {
-                    assert!(run_ctx.wr_comp.is_some());
-                    let mut wr_comp = run_ctx.wr_comp.take().unwrap();
-                    let res = wr_comp.poll(cx, &mut module, &mut run_ctx);
-                    // Store the wr_comp back so that we can reuse it.
-                    run_ctx.wr_comp = Some(wr_comp);
-                    match res {
-                        Poll::Pending => {
-                            // We can not handle new msg from channel.
-                            break;
-                        }
-                        Poll::Ready(_) => {
-                            run_ctx.wr_comp_polling = false;
-                        }
-                    }
-                }
-                // Handle new msg
-                match run_ctx.wi_rx.poll_recv(cx) {
-                    Poll::Pending => {
-                        // No msg from channel.
-                        break;
-                    }
-                    Poll::Ready(None) => {
-                        // The channel is dead.
-                        // TODO: Close it.
-                        break;
-                    }
-                    Poll::Ready(Some(msg)) => {
-                        match module.handle_msg_wr(&mut run_ctx, msg) {
-                            MsgCompletion::Instant(_, _) => {
-                                // Ready to handle next msg.
-                                continue;
-                            }
-                            MsgCompletion::Later(mut _box) => {
-                                match _box.poll(cx, &mut module, &mut run_ctx) {
-                                    Poll::Pending => {
-                                        // This msg need to be polled again.
-                                        run_ctx.wr_comp = Some(_box);
-                                        run_ctx.wr_comp_polling = true;
-                                        break;
-                                    }
-                                    Poll::Ready(_) => {
-                                        // Recycle box for next use.
-                                        run_ctx.wr_comp = Some(_box);
-                                        // Ready to handle next msg.
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
+
+        let mut wi_poll_again = true;
+        let mut ri_poll_again = true;
+        let mut ctl_poll_again = true;
+        while wi_poll_again || ri_poll_again || ctl_poll_again {
+            // Poll wi_rx.
+            if wi_poll_again {
+                match RunCtxFuture::poll_wi(cx, &mut run_ctx, &mut module) {
+                    PollResult::Pending => wi_poll_again = false,
+                    PollResult::Again => {}
                 }
             }
-            // TODO: Handle rd, ctl.
-            // TODO: Loop for limited times.
+
+            // Poll ri_rx.
+            if ri_poll_again {
+                match RunCtxFuture::poll_ri(cx, &mut run_ctx, &mut module) {
+                    PollResult::Pending => ri_poll_again = false,
+                    PollResult::Again => {}
+                }
+            }
+
+            // Poll ctl_rx.
+            if ctl_poll_again {
+                match RunCtxFuture::poll_ctl(cx, &mut run_ctx, &mut module) {
+                    PollResult::Pending => ctl_poll_again = false,
+                    PollResult::Again => {}
+                }
+            }
         }
         self.run_ctx = Some(run_ctx);
         self.module = Some(module);
-        Poll::Pending
-    }
-}
-
-struct ToQueueFuture<T>
-where
-    T: Send + Unpin + 'static,
-{
-    tx: Option<chan::Sender<T>>,
-    v: Option<T>,
-}
-
-impl<T> Future for ToQueueFuture<T>
-where
-    T: Send + Unpin + 'static,
-{
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // TODO
+        // TODO: Handle Pipeline exit.
         Poll::Pending
     }
 }
@@ -356,6 +470,8 @@ where
             rd_comp: None,
             ctl_comp_polling: false,
             ctl_comp: None,
+
+            ctl_env: None,
         };
 
         let (ro_tx_setter, ro_tx_receiver) = oneshot::channel();
